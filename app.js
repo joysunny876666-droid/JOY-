@@ -188,60 +188,74 @@ const FinMindAPI = (() => {
     return null; // null = unknown, will show stock_id instead
   }
 
-  // ── TWSE 官方 OpenAPI（主要來源，不需 token，天生支援 CORS）──────────────
+  // ── TWSE STOCK_DAY_ALL cache (all listed stocks, no params needed) ─────────
+  let _twseCache = null;
+  let _twseCacheAt = 0;
+
+  async function fetchTWSEAll() {
+    // Refresh cache every 5 min
+    if (_twseCache && Date.now() - _twseCacheAt < 5 * 60_000) return _twseCache;
+    const res = await fetch('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL');
+    if (!res.ok) throw new Error(`TWSE_ALL HTTP ${res.status}`);
+    const data = await res.json();
+    if (!Array.isArray(data) || data.length === 0) throw new Error('TWSE_ALL: 空回應');
+    _twseCache = data;
+    _twseCacheAt = Date.now();
+    return data;
+  }
+
+  // ① TWSE 官方（openapi.twse.com.tw）— 上市股票，含股票名稱
   async function getStockPriceTWSE(stockId) {
-    const parseP = v => parseFloat(String(v || '').replace(/,/g, '')) || 0;
+    const all = await fetchTWSEAll();
+    const row = all.find(d => String(d.Code) === String(stockId));
+    if (!row) throw new Error(`TWSE: ${stockId} 不在上市清單（可能為上櫃）`);
 
-    // Fetch one month's data; TWSE requires date=YYYYMMDD (Gregorian)
-    async function fetchMonth(yyyymmdd) {
-      const url = `https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY` +
-                  `?stockNo=${encodeURIComponent(stockId)}&date=${yyyymmdd}`;
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`TWSE HTTP ${res.status}`);
-      const data = await res.json();
-      if (!Array.isArray(data) || data.length === 0) return null;
-      const valid = data.filter(d => parseP(d.ClosingPrice) > 0);
-      return valid.length > 0 ? valid : null;
-    }
+    const parseP = v => parseFloat(String(v || '0').replace(/,/g, '')) || 0;
+    const close = parseP(row.ClosingPrice);
+    if (!close) throw new Error(`TWSE: ${stockId} 收盤價無效`);
 
-    // Try current Taiwan month first, then fall back to previous month
-    const now      = getTaipeiNow();
-    const currDate = fmt.date(now).replace(/-/g, '');          // e.g. "20260803"
-    let valid = await fetchMonth(currDate);
-
-    if (!valid) {
-      // Move to last day of previous month
-      const prev = new Date(now.getFullYear(), now.getMonth(), 0);
-      const prevDate = fmt.date(prev).replace(/-/g, '');       // e.g. "20260731"
-      valid = await fetchMonth(prevDate);
-    }
-
-    if (!valid || valid.length === 0) throw new Error(`TWSE: ${stockId} 查無有效資料（可能為上櫃股票）`);
-
-    const latest    = valid[valid.length - 1];
-    const close     = parseP(latest.ClosingPrice);
-
-    const changeStr = String(latest.Change || '0').replace(/,/g, '');
-    const change    = (changeStr === '--' || changeStr === '') ? 0 : (parseFloat(changeStr) || 0);
+    const changeStr = String(row.Change || '0').replace(/,/g, '');
+    const change    = /^[+\-]?\d/.test(changeStr) ? parseFloat(changeStr) : 0;
     const prevClose = close - change;
     const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
 
-    console.info(`[TWSE] ${stockId} 收盤價: ${close}，漲跌: ${change > 0 ? '+' : ''}${change}`);
-    return { price: close, change, changePct, date: String(latest.Date || '') };
+    console.info(`[TWSE] ${stockId}(${row.Name}) 收盤:${close} 漲跌:${change >= 0 ? '+' : ''}${change}`);
+    return { price: close, change, changePct, date: fmt.date(), _twseName: row.Name || null };
   }
 
-  // ── FinMind（備援，CORS 限制較多）─────────────────────────────────────────
+  // ② Yahoo Finance — 上市/上櫃皆可（.TW / .TWO）
+  async function getStockPriceYahoo(stockId) {
+    for (const suffix of ['.TW', '.TWO']) {
+      try {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/` +
+                    `${stockId}${suffix}?interval=1d&range=5d&includePrePost=false`;
+        const res = await fetch(url, { headers: { Accept: 'application/json' } });
+        if (!res.ok) continue;
+        const json = await res.json();
+        const meta = json?.chart?.result?.[0]?.meta;
+        if (!meta?.regularMarketPrice) continue;
+
+        const price     = meta.regularMarketPrice;
+        const prevClose = meta.previousClose || meta.chartPreviousClose || price;
+        const change    = price - prevClose;
+        const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
+        console.info(`[Yahoo] ${stockId}${suffix} 現價:${price}`);
+        return { price, change, changePct, date: fmt.date() };
+      } catch { continue; }
+    }
+    throw new Error(`Yahoo: ${stockId} 查無資料`);
+  }
+
+  // ③ FinMind（備援，CORS 受限但有 proxy 保底）
   async function getStockPriceFinMind(stockId) {
-    const startDate = fmt.daysAgo(10);
     const data = await fetchJSON({
       dataset: 'TaiwanStockPrice',
       stock_id: stockId,
-      start_date: startDate,
+      start_date: fmt.daysAgo(10),
     });
     if (!data || data.length === 0) throw new Error(`FinMind: 查無 ${stockId} 近10日資料`);
     const sorted    = [...data].sort((a, b) => b.date.localeCompare(a.date));
-    const latest    = sorted[0];
-    const prev      = sorted[1] || latest;
+    const latest    = sorted[0], prev = sorted[1] || latest;
     const close     = parseFloat(latest.close);
     const prevClose = parseFloat(prev.close);
     const change    = close - prevClose;
@@ -249,14 +263,19 @@ const FinMindAPI = (() => {
     return { price: close, change, changePct, date: latest.date };
   }
 
-  // ── 合併：先 TWSE，失敗才用 FinMind ──────────────────────────────────────
+  // 三層 cascade：TWSE → Yahoo → FinMind
   async function getStockPrice(stockId) {
-    try {
-      return await getStockPriceTWSE(stockId);
-    } catch (e) {
-      console.warn(`[TWSE] ${stockId} 失敗（${e.message}），改用 FinMind...`);
-      return await getStockPriceFinMind(stockId);
+    const methods = [
+      { name: 'TWSE',   fn: () => getStockPriceTWSE(stockId)   },
+      { name: 'Yahoo',  fn: () => getStockPriceYahoo(stockId)  },
+      { name: 'FinMind', fn: () => getStockPriceFinMind(stockId) },
+    ];
+    let lastErr;
+    for (const { name, fn } of methods) {
+      try   { return await fn(); }
+      catch (e) { console.warn(`[Price] ${name} failed for ${stockId}: ${e.message}`); lastErr = e; }
     }
+    throw new Error(`無法取得 ${stockId} 股價：${lastErr?.message}`);
   }
 
   return {
@@ -274,10 +293,13 @@ const FinMindAPI = (() => {
 
     async fetchPrice(stockId) {
       const priceData = await getStockPrice(stockId);
-      const name      = await getStockName(stockId);
-      const result    = { name: name || stockId, ...priceData };
+      // Use name from TWSE response if available (saves an extra API call)
+      const twseName = priceData._twseName;
+      delete priceData._twseName;
+      const name = twseName || await getStockName(stockId) || stockId;
+      const result = { name, ...priceData };
       cache.set(stockId, result);
-      attemptedSet.add(stockId); // ★ Fix 2: mark as done
+      attemptedSet.add(stockId);
       return result;
     },
 
