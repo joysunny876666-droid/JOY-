@@ -148,7 +148,6 @@ const FinMindAPI = (() => {
         exec: () => fetch(`https://corsproxy.io/?${encodeURIComponent(directUrl)}`),
       },
     ];
-
     let lastErr = null;
     for (const { name, exec } of strategies) {
       try {
@@ -160,16 +159,13 @@ const FinMindAPI = (() => {
         return data;
       } catch (e) {
         lastErr = e;
-        // Real API / HTTP errors: do NOT retry
-        if (/^HTTP_|^API_ERR/.test(e.message)) {
-          throw new Error(e.message.replace('HTTP_', 'HTTP ').replace('API_ERR: ', ''));
-        }
         console.warn(`[FinMind] ${name} 失敗:`, e.message);
       }
     }
 
     // All 4 strategies failed
-    throw new Error(`所有連線方式均失敗。請按 Ctrl+Shift+R 強制重載，或稍後再試。`);
+    let errMsg = lastErr ? lastErr.message.replace('HTTP_', 'HTTP ').replace('API_ERR: ', '') : '未知錯誤';
+    throw new Error(`FinMind API 無法連線 (${errMsg})`);
   }
 
   // ★ Fix 1: filter by stock_id so we don't get the first stock in the whole list
@@ -195,10 +191,30 @@ const FinMindAPI = (() => {
   async function fetchTWSEAll() {
     // Refresh cache every 5 min
     if (_twseCache && Date.now() - _twseCacheAt < 5 * 60_000) return _twseCache;
-    const res = await fetch('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL');
+    
+    // openapi.twse.com.tw lacks CORS headers. We use the official www.twse.com.tw endpoint which returns CSV and supports CORS.
+    const res = await fetch('https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data');
     if (!res.ok) throw new Error(`TWSE_ALL HTTP ${res.status}`);
-    const data = await res.json();
-    if (!Array.isArray(data) || data.length === 0) throw new Error('TWSE_ALL: 空回應');
+    const text = await res.text();
+    
+    const lines = text.split('\n');
+    const data = [];
+    for (let i = 1; i < lines.length; i++) { // Skip header
+      const line = lines[i].trim();
+      if (!line) continue;
+      // CSV format: "Date","Code","Name","Volume","Value","Open","High","Low","Close","Change","Transaction"
+      const parts = line.split('","');
+      if (parts.length >= 10) {
+        data.push({
+          Code: parts[1].replace(/"/g, ''),
+          Name: parts[2].replace(/"/g, ''),
+          ClosingPrice: parts[8].replace(/"/g, ''),
+          Change: parts[9].replace(/"/g, '')
+        });
+      }
+    }
+    
+    if (data.length === 0) throw new Error('TWSE_ALL: 解析失敗或無資料');
     _twseCache = data;
     _twseCacheAt = Date.now();
     return data;
