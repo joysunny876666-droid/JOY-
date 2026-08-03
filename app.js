@@ -105,14 +105,58 @@ const FinMindAPI = (() => {
   const attemptedSet = new Set();  // stockIds that have been fetched (success OR fail)
 
   async function fetchJSON(params) {
-    const url = new URL(CONFIG.apiBase);
-    Object.entries({ ...params, token: CONFIG.token })
-      .forEach(([k, v]) => url.searchParams.set(k, v));
-    const res = await fetch(url.toString());
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
-    if (json.status !== 200) throw new Error(json.msg || 'API error');
-    return json.data;
+    const qp = { ...params, token: CONFIG.token };
+
+    // Build GET URL
+    const getUrl = new URL(CONFIG.apiBase);
+    Object.entries(qp).forEach(([k, v]) => getUrl.searchParams.set(k, v));
+    const directUrl = getUrl.toString();
+
+    // Build POST body (application/x-www-form-urlencoded = CORS simple request)
+    const postBody = new URLSearchParams(qp).toString();
+
+    // Parse FinMind JSON response
+    async function parse(res) {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      let json;
+      try { json = JSON.parse(text); } catch { throw new Error('回應格式錯誤'); }
+      if (json.status !== 200) throw new Error(json.msg || `API 錯誤 (${json.status})`);
+      return json.data;
+    }
+
+    // ── Attempt 1: POST direct (form-urlencoded = no preflight) ──────────────
+    try {
+      const res = await fetch(CONFIG.apiBase, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: postBody,
+      });
+      return await parse(res);
+    } catch (e1) {
+      // Re-throw real API/HTTP errors immediately
+      if (/^HTTP|^API|^回應/.test(e1.message)) throw e1;
+      console.warn('[FinMind] POST direct failed:', e1.message);
+    }
+
+    // ── Attempt 2: GET direct ────────────────────────────────────────────────
+    try {
+      const res = await fetch(directUrl);
+      return await parse(res);
+    } catch (e2) {
+      if (/^HTTP|^API|^回應/.test(e2.message)) throw e2;
+      console.warn('[FinMind] GET direct failed:', e2.message);
+    }
+
+    // ── Attempt 3: CORS proxy (corsproxy.io) ─────────────────────────────────
+    try {
+      const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(directUrl)}`;
+      const res = await fetch(proxyUrl);
+      return await parse(res);
+    } catch (e3) {
+      console.error('[FinMind] All attempts failed:', e3.message);
+      throw new Error('FinMind API 無法連線（CORS / 網路問題）。請確認網路或稍後再試。');
+    }
   }
 
   // ★ Fix 1: filter by stock_id so we don't get the first stock in the whole list
