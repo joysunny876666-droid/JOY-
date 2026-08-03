@@ -188,24 +188,60 @@ const FinMindAPI = (() => {
     return null; // null = unknown, will show stock_id instead
   }
 
-  async function getStockPrice(stockId) {
-    const startDate = fmt.daysAgo(10); // look back 10 days to handle holidays
+  // ── TWSE 官方 OpenAPI（主要來源，不需 token，天生支援 CORS）──────────────
+  async function getStockPriceTWSE(stockId) {
+    const url = `https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY?stockNo=${encodeURIComponent(stockId)}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`TWSE HTTP ${res.status}`);
+    const data = await res.json();
+    if (!Array.isArray(data) || data.length === 0) throw new Error(`TWSE: 查無 ${stockId}（可能為上櫃股票）`);
+
+    const parseP = v => parseFloat(String(v || '').replace(/,/g, '')) || 0;
+
+    // Entries are oldest→latest; filter out rows without a valid close price (e.g. '--')
+    const valid = data.filter(d => parseP(d.ClosingPrice) > 0);
+    if (valid.length === 0) throw new Error(`TWSE: ${stockId} 無有效收盤價`);
+
+    const latest    = valid[valid.length - 1];
+    const close     = parseP(latest.ClosingPrice);
+
+    // Use the official Change field (e.g. "+5.00", "-3.50", "0.00")
+    const changeStr = String(latest.Change || '0').replace(/,/g, '');
+    const change    = (changeStr === '--' || changeStr === '') ? 0 : (parseFloat(changeStr) || 0);
+    const prevClose = close - change;
+    const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
+
+    console.info(`[TWSE] ${stockId} 收盤價: ${close}，漲跌: ${change}`);
+    return { price: close, change, changePct, date: String(latest.Date || '') };
+  }
+
+  // ── FinMind（備援，CORS 限制較多）─────────────────────────────────────────
+  async function getStockPriceFinMind(stockId) {
+    const startDate = fmt.daysAgo(10);
     const data = await fetchJSON({
       dataset: 'TaiwanStockPrice',
       stock_id: stockId,
       start_date: startDate,
     });
-    if (!data || data.length === 0) throw new Error(`無 ${stockId} 的價格資料（近 10 個交易日）`);
-
-    const sorted  = [...data].sort((a, b) => b.date.localeCompare(a.date));
-    const latest  = sorted[0];
-    const prev    = sorted[1] || latest;
-    const close   = parseFloat(latest.close);
+    if (!data || data.length === 0) throw new Error(`FinMind: 查無 ${stockId} 近10日資料`);
+    const sorted    = [...data].sort((a, b) => b.date.localeCompare(a.date));
+    const latest    = sorted[0];
+    const prev      = sorted[1] || latest;
+    const close     = parseFloat(latest.close);
     const prevClose = parseFloat(prev.close);
     const change    = close - prevClose;
     const changePct = prevClose !== 0 ? (change / prevClose) * 100 : 0;
-
     return { price: close, change, changePct, date: latest.date };
+  }
+
+  // ── 合併：先 TWSE，失敗才用 FinMind ──────────────────────────────────────
+  async function getStockPrice(stockId) {
+    try {
+      return await getStockPriceTWSE(stockId);
+    } catch (e) {
+      console.warn(`[TWSE] ${stockId} 失敗（${e.message}），改用 FinMind...`);
+      return await getStockPriceFinMind(stockId);
+    }
   }
 
   return {
