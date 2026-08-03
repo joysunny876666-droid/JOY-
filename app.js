@@ -190,28 +190,43 @@ const FinMindAPI = (() => {
 
   // ── TWSE 官方 OpenAPI（主要來源，不需 token，天生支援 CORS）──────────────
   async function getStockPriceTWSE(stockId) {
-    const url = `https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY?stockNo=${encodeURIComponent(stockId)}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`TWSE HTTP ${res.status}`);
-    const data = await res.json();
-    if (!Array.isArray(data) || data.length === 0) throw new Error(`TWSE: 查無 ${stockId}（可能為上櫃股票）`);
-
     const parseP = v => parseFloat(String(v || '').replace(/,/g, '')) || 0;
 
-    // Entries are oldest→latest; filter out rows without a valid close price (e.g. '--')
-    const valid = data.filter(d => parseP(d.ClosingPrice) > 0);
-    if (valid.length === 0) throw new Error(`TWSE: ${stockId} 無有效收盤價`);
+    // Fetch one month's data; TWSE requires date=YYYYMMDD (Gregorian)
+    async function fetchMonth(yyyymmdd) {
+      const url = `https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY` +
+                  `?stockNo=${encodeURIComponent(stockId)}&date=${yyyymmdd}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`TWSE HTTP ${res.status}`);
+      const data = await res.json();
+      if (!Array.isArray(data) || data.length === 0) return null;
+      const valid = data.filter(d => parseP(d.ClosingPrice) > 0);
+      return valid.length > 0 ? valid : null;
+    }
+
+    // Try current Taiwan month first, then fall back to previous month
+    const now      = getTaipeiNow();
+    const currDate = fmt.date(now).replace(/-/g, '');          // e.g. "20260803"
+    let valid = await fetchMonth(currDate);
+
+    if (!valid) {
+      // Move to last day of previous month
+      const prev = new Date(now.getFullYear(), now.getMonth(), 0);
+      const prevDate = fmt.date(prev).replace(/-/g, '');       // e.g. "20260731"
+      valid = await fetchMonth(prevDate);
+    }
+
+    if (!valid || valid.length === 0) throw new Error(`TWSE: ${stockId} 查無有效資料（可能為上櫃股票）`);
 
     const latest    = valid[valid.length - 1];
     const close     = parseP(latest.ClosingPrice);
 
-    // Use the official Change field (e.g. "+5.00", "-3.50", "0.00")
     const changeStr = String(latest.Change || '0').replace(/,/g, '');
     const change    = (changeStr === '--' || changeStr === '') ? 0 : (parseFloat(changeStr) || 0);
     const prevClose = close - change;
     const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
 
-    console.info(`[TWSE] ${stockId} 收盤價: ${close}，漲跌: ${change}`);
+    console.info(`[TWSE] ${stockId} 收盤價: ${close}，漲跌: ${change > 0 ? '+' : ''}${change}`);
     return { price: close, change, changePct, date: String(latest.Date || '') };
   }
 
