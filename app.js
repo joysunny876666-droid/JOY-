@@ -107,56 +107,69 @@ const FinMindAPI = (() => {
   async function fetchJSON(params) {
     const qp = { ...params, token: CONFIG.token };
 
-    // Build GET URL
+    // Build direct GET URL
     const getUrl = new URL(CONFIG.apiBase);
     Object.entries(qp).forEach(([k, v]) => getUrl.searchParams.set(k, v));
     const directUrl = getUrl.toString();
 
-    // Build POST body (application/x-www-form-urlencoded = CORS simple request)
+    // Build POST form body
     const postBody = new URLSearchParams(qp).toString();
 
-    // Parse FinMind JSON response
+    // Parse a FinMind response — throws on HTTP / API errors
     async function parse(res) {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`HTTP_${res.status}`);
       const text = await res.text();
       let json;
-      try { json = JSON.parse(text); } catch { throw new Error('回應格式錯誤'); }
-      if (json.status !== 200) throw new Error(json.msg || `API 錯誤 (${json.status})`);
+      try { json = JSON.parse(text); } catch { throw new Error('FORMAT_ERR'); }
+      if (json.status !== 200) throw new Error(`API_ERR: ${json.msg || json.status}`);
       return json.data;
     }
 
-    // ── Attempt 1: POST direct (form-urlencoded = no preflight) ──────────────
-    try {
-      const res = await fetch(CONFIG.apiBase, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: postBody,
-      });
-      return await parse(res);
-    } catch (e1) {
-      // Re-throw real API/HTTP errors immediately
-      if (/^HTTP|^API|^回應/.test(e1.message)) throw e1;
-      console.warn('[FinMind] POST direct failed:', e1.message);
+    // Four attempts in order — stop on first success
+    const strategies = [
+      {
+        name: 'POST direct',
+        exec: () => fetch(CONFIG.apiBase, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: postBody,
+        }),
+      },
+      {
+        name: 'GET direct',
+        exec: () => fetch(directUrl),
+      },
+      {
+        name: 'allorigins proxy',
+        exec: () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`),
+      },
+      {
+        name: 'corsproxy.io',
+        exec: () => fetch(`https://corsproxy.io/?${encodeURIComponent(directUrl)}`),
+      },
+    ];
+
+    let lastErr = null;
+    for (const { name, exec } of strategies) {
+      try {
+        const res  = await exec();
+        const data = await parse(res);
+        if (name !== 'POST direct' && name !== 'GET direct') {
+          console.info(`[FinMind] 成功 via ${name}`);
+        }
+        return data;
+      } catch (e) {
+        lastErr = e;
+        // Real API / HTTP errors: do NOT retry
+        if (/^HTTP_|^API_ERR/.test(e.message)) {
+          throw new Error(e.message.replace('HTTP_', 'HTTP ').replace('API_ERR: ', ''));
+        }
+        console.warn(`[FinMind] ${name} 失敗:`, e.message);
+      }
     }
 
-    // ── Attempt 2: GET direct ────────────────────────────────────────────────
-    try {
-      const res = await fetch(directUrl);
-      return await parse(res);
-    } catch (e2) {
-      if (/^HTTP|^API|^回應/.test(e2.message)) throw e2;
-      console.warn('[FinMind] GET direct failed:', e2.message);
-    }
-
-    // ── Attempt 3: CORS proxy (corsproxy.io) ─────────────────────────────────
-    try {
-      const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(directUrl)}`;
-      const res = await fetch(proxyUrl);
-      return await parse(res);
-    } catch (e3) {
-      console.error('[FinMind] All attempts failed:', e3.message);
-      throw new Error('FinMind API 無法連線（CORS / 網路問題）。請確認網路或稍後再試。');
-    }
+    // All 4 strategies failed
+    throw new Error(`所有連線方式均失敗。請按 Ctrl+Shift+R 強制重載，或稍後再試。`);
   }
 
   // ★ Fix 1: filter by stock_id so we don't get the first stock in the whole list
