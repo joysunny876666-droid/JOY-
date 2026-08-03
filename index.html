@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>台股投資組合模擬器 | TW Stock Portfolio</title>
+  <meta name="description" content="即時追蹤台灣股票投資組合市值，支援成本計算與未實現損益分析，資料由 FinMind API 提供" />
+  <meta name="keywords" content="台股,投資組合,股票模擬器,台灣股市,損益計算" />
+
+  <!-- Open Graph -->
+  <meta property="og:title" content="台股投資組合模擬器" />
+  <meta property="og:description" content="即時台灣股票投資組合追蹤器" />
+  <meta property="og:type" content="website" />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- Font Awesome -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+
+  <!-- App Styles -->
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- Animated Background -->
+  <div class="bg-canvas" aria-hidden="true">
+    <div class="grid-overlay"></div>
+  </div>
+
+  <!-- ===== HEADER ===== -->
+  <header class="header" role="banner">
+    <div class="header-logo">
+      <div class="logo-icon" aria-hidden="true">📈</div>
+      <span class="logo-text">台股<span>模擬器</span></span>
+    </div>
+
+    <div class="header-center">
+      <div class="market-badge closed" id="market-badge" aria-live="polite">
+        <div class="status-pulse" id="market-pulse"></div>
+        <span id="market-label">載入中...</span>
+      </div>
+      <span class="last-updated" id="last-updated" aria-label="最後更新時間">—</span>
+    </div>
+
+    <div class="header-right">
+      <button class="btn btn-icon" id="refresh-btn" title="立即更新" aria-label="立即更新股價">
+        <i class="fas fa-rotate-right"></i>
+      </button>
+    </div>
+  </header>
+
+  <!-- ===== MAIN ===== -->
+  <main class="container" role="main">
+
+    <!-- Summary Cards -->
+    <section class="cards-grid" aria-label="投資組合摘要">
+
+      <article class="card stat-card" id="card-total-value">
+        <div class="stat-icon">💼</div>
+        <div class="stat-label">投資組合市值</div>
+        <div class="stat-value" id="stat-total-value">—</div>
+        <div class="stat-sub" id="stat-today-change">今日變動 —</div>
+      </article>
+
+      <article class="card stat-card" id="card-total-cost">
+        <div class="stat-icon">💰</div>
+        <div class="stat-label">總投入成本</div>
+        <div class="stat-value" id="stat-total-cost">—</div>
+        <div class="stat-sub">買入均成本</div>
+      </article>
+
+      <article class="card stat-card" id="card-pnl">
+        <div class="stat-icon">📊</div>
+        <div class="stat-label">未實現損益</div>
+        <div class="stat-value" id="stat-pnl">—</div>
+        <div class="stat-sub" id="stat-pnl-pct">—</div>
+      </article>
+
+      <article class="card stat-card" id="card-count">
+        <div class="stat-icon">🏢</div>
+        <div class="stat-label">持股檔數</div>
+        <div class="stat-value" id="stat-count">0</div>
+        <div class="stat-sub">支股票</div>
+      </article>
+
+    </section>
+
+    <!-- Charts -->
+    <section class="charts-grid" aria-label="圖表分析">
+
+      <div class="card chart-card">
+        <div class="card-header">
+          <h2>持倉配置</h2>
+          <span class="badge">圓餅圖</span>
+        </div>
+        <div class="chart-body" id="pie-container">
+          <div class="chart-empty" id="pie-empty">
+            <div class="empty-icon">🥧</div>
+            <span>新增股票後顯示配置圖</span>
+          </div>
+          <canvas id="pie-chart" style="display:none;" aria-label="持倉配置圓餅圖" role="img"></canvas>
+        </div>
+      </div>
+
+      <div class="card chart-card">
+        <div class="card-header">
+          <h2>市值走勢</h2>
+          <span class="badge" id="line-chart-badge">今日</span>
+        </div>
+        <div class="chart-body line-body" id="line-container">
+          <div class="chart-empty" id="line-empty">
+            <div class="empty-icon">📉</div>
+            <span>開市後每 30 分鐘自動記錄</span>
+          </div>
+          <canvas id="line-chart" style="display:none;" aria-label="投資組合市值走勢折線圖" role="img"></canvas>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- Portfolio Table -->
+    <section class="card table-card" aria-label="持股明細">
+      <div class="card-header">
+        <h2>持股明細</h2>
+        <button class="btn btn-primary" id="add-stock-btn" aria-label="新增股票">
+          <i class="fas fa-plus"></i>
+          新增股票
+        </button>
+      </div>
+      <div class="table-wrapper" role="region" aria-label="持股列表" tabindex="0">
+        <table id="portfolio-table" aria-label="持股明細表格">
+          <thead>
+            <tr>
+              <th scope="col">股票</th>
+              <th scope="col">現價</th>
+              <th scope="col">漲跌</th>
+              <th scope="col">持股數</th>
+              <th scope="col">成本均價</th>
+              <th scope="col">投入成本</th>
+              <th scope="col">市值</th>
+              <th scope="col">未實現損益</th>
+              <th scope="col">損益 %</th>
+              <th scope="col">操作</th>
+            </tr>
+          </thead>
+          <tbody id="portfolio-tbody">
+            <tr id="empty-row">
+              <td colspan="10" class="empty-state">
+                <div class="empty-state-icon">📭</div>
+                <div>尚無持股，點擊右上角「新增股票」開始</div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ===== ADD / EDIT MODAL ===== -->
+  <div class="modal-overlay hidden" id="stock-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="modal-title">新增股票</h3>
+        <button class="btn btn-icon" id="modal-close" aria-label="關閉">
+          <i class="fas fa-xmark"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <form id="stock-form" novalidate>
+          <input type="hidden" id="edit-original-id" />
+
+          <div class="form-group">
+            <label for="input-stock-id">股票代號</label>
+            <input
+              type="text"
+              id="input-stock-id"
+              placeholder="例：2330（台積電）"
+              required
+              autocomplete="off"
+              maxlength="6"
+            />
+            <span class="input-hint" id="stock-name-hint">輸入代號後自動查詢公司名稱</span>
+          </div>
+
+          <div class="form-group">
+            <label for="input-shares">持股數量（股）</label>
+            <input
+              type="number"
+              id="input-shares"
+              placeholder="例：1000"
+              min="1"
+              step="1"
+              required
+            />
+          </div>
+
+          <div class="form-group">
+            <label for="input-cost">買入均價（元 / 股）</label>
+            <input
+              type="number"
+              id="input-cost"
+              placeholder="例：580.00"
+              min="0.01"
+              step="0.01"
+              required
+            />
+          </div>
+
+          <div class="form-actions">
+            <button type="button" class="btn btn-secondary" id="modal-cancel">取消</button>
+            <button type="submit" class="btn btn-primary" id="modal-submit">確認新增</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== TOAST NOTIFICATION ===== -->
+  <div id="notification" class="hidden" role="alert" aria-live="polite"></div>
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+
+  <!-- App -->
+  <script src="app.js"></script>
+</body>
+</html>
