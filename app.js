@@ -79,13 +79,27 @@ const Storage = (() => {
     getPortfolio() { try { return JSON.parse(localStorage.getItem(KEYS.portfolio)) || []; } catch { return []; } },
     savePortfolio(d) { localStorage.setItem(KEYS.portfolio, JSON.stringify(d)); },
     getHistory()   { try { return JSON.parse(localStorage.getItem(KEYS.history))  || {}; } catch { return {}; } },
-    appendHistory(totalValue) {
+    appendHistory(stats, stocks, getPriceData) {
       const today = fmt.date();
       const history = this.getHistory();
       if (!history[today]) history[today] = [];
-      const entry = { time: fmt.time(), value: Math.round(totalValue) };
+      
+      const stocksMap = {};
+      if (stocks && getPriceData) {
+        stocks.forEach(s => {
+          const p = getPriceData(s.id);
+          if (p) stocksMap[s.id] = { name: p.name, price: p.price, value: Math.round(p.price * s.shares) };
+        });
+      }
+      
+      const entry = { time: fmt.time(), value: Math.round(stats.totalValue), stocks: stocksMap };
       const last = history[today].at(-1);
-      if (!last || last.time.slice(0, 5) !== entry.time.slice(0, 5)) history[today].push(entry);
+      if (last && last.time.slice(0, 5) === entry.time.slice(0, 5)) {
+        history[today][history[today].length - 1] = entry;
+      } else {
+        history[today].push(entry);
+      }
+      
       const allDates = Object.keys(history).sort();
       while (allDates.length > 7) delete history[allDates.shift()];
       localStorage.setItem(KEYS.history, JSON.stringify(history));
@@ -97,25 +111,18 @@ const Storage = (() => {
 
 /* ============================================================
    FINMIND API
-   ★ Fix 1: getStockName — filter data array by stock_id
-   ★ Fix 2: attemptedSet — track fetch attempts to stop ∞ skeleton
 ============================================================ */
 const FinMindAPI = (() => {
-  const cache       = new Map();   // stockId → { name, price, change, changePct, date }
-  const attemptedSet = new Set();  // stockIds that have been fetched (success OR fail)
+  const cache       = new Map();
+  const attemptedSet = new Set();
 
   async function fetchJSON(params) {
     const qp = { ...params, token: CONFIG.token };
-
-    // Build direct GET URL
     const getUrl = new URL(CONFIG.apiBase);
     Object.entries(qp).forEach(([k, v]) => getUrl.searchParams.set(k, v));
     const directUrl = getUrl.toString();
-
-    // Build POST form body
     const postBody = new URLSearchParams(qp).toString();
 
-    // Parse a FinMind response — throws on HTTP / API errors
     async function parse(res) {
       if (!res.ok) throw new Error(`HTTP_${res.status}`);
       const text = await res.text();
@@ -125,171 +132,115 @@ const FinMindAPI = (() => {
       return json.data;
     }
 
-    // Four attempts in order — stop on first success
     const strategies = [
-      {
-        name: 'POST direct',
-        exec: () => fetch(CONFIG.apiBase, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: postBody,
-        }),
-      },
-      {
-        name: 'GET direct',
-        exec: () => fetch(directUrl),
-      },
-      {
-        name: 'allorigins proxy',
-        exec: () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`),
-      },
-      {
-        name: 'corsproxy.io',
-        exec: () => fetch(`https://corsproxy.io/?${encodeURIComponent(directUrl)}`),
-      },
+      { name: 'POST direct', exec: () => fetch(CONFIG.apiBase, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: postBody }) },
+      { name: 'GET direct', exec: () => fetch(directUrl) },
+      { name: 'allorigins proxy', exec: () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`) },
+      { name: 'corsproxy.io', exec: () => fetch(`https://corsproxy.io/?${encodeURIComponent(directUrl)}`) },
     ];
     let lastErr = null;
     for (const { name, exec } of strategies) {
       try {
         const res  = await exec();
         const data = await parse(res);
-        if (name !== 'POST direct' && name !== 'GET direct') {
-          console.info(`[FinMind] 成功 via ${name}`);
-        }
         return data;
       } catch (e) {
         lastErr = e;
-        console.warn(`[FinMind] ${name} 失敗:`, e.message);
       }
     }
-
-    // All 4 strategies failed
     let errMsg = lastErr ? lastErr.message.replace('HTTP_', 'HTTP ').replace('API_ERR: ', '') : '未知錯誤';
     throw new Error(`FinMind API 無法連線 (${errMsg})`);
   }
 
-  // ★ Fix 1: filter by stock_id so we don't get the first stock in the whole list
   async function getStockName(stockId) {
     try {
       const data = await fetchJSON({ dataset: 'TaiwanStockInfo', stock_id: stockId });
       if (data && data.length > 0) {
         const match = data.find(d => String(d.stock_id) === String(stockId));
         if (match && match.stock_name) return match.stock_name;
-        // Fallback: if API ignores filter, try searching manually
-        console.warn(`[FinMind] TaiwanStockInfo filter may not work for ${stockId}, got ${data.length} rows`);
       }
-    } catch (e) {
-      console.warn('[FinMind] getStockName failed:', stockId, e.message);
-    }
-    return null; // null = unknown, will show stock_id instead
+    } catch (e) { console.warn('[FinMind] getStockName failed:', stockId, e.message); }
+    return null;
   }
 
-  // ── TWSE STOCK_DAY_ALL cache (all listed stocks, no params needed) ─────────
   let _twseCache = null;
   let _twseCacheAt = 0;
 
   async function fetchTWSEAll() {
-    // Refresh cache every 5 min
     if (_twseCache && Date.now() - _twseCacheAt < 5 * 60_000) return _twseCache;
-    
-    // openapi.twse.com.tw lacks CORS headers. We use the official www.twse.com.tw endpoint which returns CSV and supports CORS.
     const res = await fetch('https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data');
     if (!res.ok) throw new Error(`TWSE_ALL HTTP ${res.status}`);
     const text = await res.text();
-    
     const lines = text.split('\n');
     const data = [];
-    for (let i = 1; i < lines.length; i++) { // Skip header
+    for (let i = 1; i < lines.length; i++) {
       const line = lines[i].trim();
       if (!line) continue;
-      // CSV format: "Date","Code","Name","Volume","Value","Open","High","Low","Close","Change","Transaction"
       const parts = line.split('","');
       if (parts.length >= 10) {
-        data.push({
-          Code: parts[1].replace(/"/g, ''),
-          Name: parts[2].replace(/"/g, ''),
-          ClosingPrice: parts[8].replace(/"/g, ''),
-          Change: parts[9].replace(/"/g, '')
-        });
+        data.push({ Code: parts[1].replace(/"/g, ''), Name: parts[2].replace(/"/g, ''), ClosingPrice: parts[8].replace(/"/g, ''), Change: parts[9].replace(/"/g, '') });
       }
     }
-    
-    if (data.length === 0) throw new Error('TWSE_ALL: 解析失敗或無資料');
     _twseCache = data;
     _twseCacheAt = Date.now();
     return data;
   }
 
-  // ① TWSE 官方（openapi.twse.com.tw）— 上市股票，含股票名稱
   async function getStockPriceTWSE(stockId) {
     const all = await fetchTWSEAll();
     const row = all.find(d => String(d.Code) === String(stockId));
-    if (!row) throw new Error(`TWSE: ${stockId} 不在上市清單（可能為上櫃）`);
-
+    if (!row) throw new Error(`TWSE: ${stockId} 不在上市清單`);
     const parseP = v => parseFloat(String(v || '0').replace(/,/g, '')) || 0;
     const close = parseP(row.ClosingPrice);
     if (!close) throw new Error(`TWSE: ${stockId} 收盤價無效`);
-
     const changeStr = String(row.Change || '0').replace(/,/g, '');
     const change    = /^[+\-]?\d/.test(changeStr) ? parseFloat(changeStr) : 0;
     const prevClose = close - change;
     const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
-
-    console.info(`[TWSE] ${stockId}(${row.Name}) 收盤:${close} 漲跌:${change >= 0 ? '+' : ''}${change}`);
     return { price: close, change, changePct, date: fmt.date(), _twseName: row.Name || null };
   }
 
-  // ② Yahoo Finance — 上市/上櫃皆可（.TW / .TWO）
   async function getStockPriceYahoo(stockId) {
     for (const suffix of ['.TW', '.TWO']) {
       try {
-        const url = `https://query1.finance.yahoo.com/v8/finance/chart/` +
-                    `${stockId}${suffix}?interval=1d&range=5d&includePrePost=false`;
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${stockId}${suffix}?interval=1d&range=5d&includePrePost=false`;
         const res = await fetch(url, { headers: { Accept: 'application/json' } });
         if (!res.ok) continue;
         const json = await res.json();
         const meta = json?.chart?.result?.[0]?.meta;
         if (!meta?.regularMarketPrice) continue;
-
         const price     = meta.regularMarketPrice;
         const prevClose = meta.previousClose || meta.chartPreviousClose || price;
         const change    = price - prevClose;
         const changePct = prevClose > 0 ? (change / prevClose) * 100 : 0;
-        console.info(`[Yahoo] ${stockId}${suffix} 現價:${price}`);
         return { price, change, changePct, date: fmt.date() };
       } catch { continue; }
     }
     throw new Error(`Yahoo: ${stockId} 查無資料`);
   }
 
-  // ③ FinMind（備援，CORS 受限但有 proxy 保底）
   async function getStockPriceFinMind(stockId) {
-    const data = await fetchJSON({
-      dataset: 'TaiwanStockPrice',
-      stock_id: stockId,
-      start_date: fmt.daysAgo(10),
-    });
-    if (!data || data.length === 0) throw new Error(`FinMind: 查無 ${stockId} 近10日資料`);
-    const sorted    = [...data].sort((a, b) => b.date.localeCompare(a.date));
-    const latest    = sorted[0], prev = sorted[1] || latest;
-    const close     = parseFloat(latest.close);
+    const data = await fetchJSON({ dataset: 'TaiwanStockPrice', stock_id: stockId, start_date: fmt.daysAgo(10) });
+    if (!data || data.length === 0) throw new Error(`FinMind: 查無 ${stockId} 資料`);
+    const sorted = [...data].sort((a, b) => b.date.localeCompare(a.date));
+    const latest = sorted[0], prev = sorted[1] || latest;
+    const close = parseFloat(latest.close);
     const prevClose = parseFloat(prev.close);
-    const change    = close - prevClose;
+    const change = close - prevClose;
     const changePct = prevClose !== 0 ? (change / prevClose) * 100 : 0;
     return { price: close, change, changePct, date: latest.date };
   }
 
-  // 三層 cascade：TWSE → Yahoo → FinMind
   async function getStockPrice(stockId) {
     const methods = [
-      { name: 'TWSE',   fn: () => getStockPriceTWSE(stockId)   },
-      { name: 'Yahoo',  fn: () => getStockPriceYahoo(stockId)  },
+      { name: 'TWSE', fn: () => getStockPriceTWSE(stockId) },
+      { name: 'Yahoo', fn: () => getStockPriceYahoo(stockId) },
       { name: 'FinMind', fn: () => getStockPriceFinMind(stockId) },
     ];
     let lastErr;
     for (const { name, fn } of methods) {
       try   { return await fn(); }
-      catch (e) { console.warn(`[Price] ${name} failed for ${stockId}: ${e.message}`); lastErr = e; }
+      catch (e) { lastErr = e; }
     }
     throw new Error(`無法取得 ${stockId} 股價：${lastErr?.message}`);
   }
@@ -297,19 +248,15 @@ const FinMindAPI = (() => {
   return {
     cache,
     attemptedSet,
-
     hasAttempted(stockId) { return attemptedSet.has(stockId); },
-
     async lookupName(stockId) {
       if (cache.has(stockId) && cache.get(stockId).name) return cache.get(stockId).name;
       const name = await getStockName(stockId);
       cache.set(stockId, { ...(cache.get(stockId) || {}), name: name || stockId });
       return name || stockId;
     },
-
     async fetchPrice(stockId) {
       const priceData = await getStockPrice(stockId);
-      // Use name from TWSE response if available (saves an extra API call)
       const twseName = priceData._twseName;
       delete priceData._twseName;
       const name = twseName || await getStockName(stockId) || stockId;
@@ -318,24 +265,16 @@ const FinMindAPI = (() => {
       attemptedSet.add(stockId);
       return result;
     },
-
-    // ★ Fix 2: mark attempted even on failure
     async refreshAll(stockIds) {
       const results = {};
       await Promise.allSettled(
         stockIds.map(async id => {
-          try {
-            results[id] = await this.fetchPrice(id);
-          } catch (e) {
-            console.warn(`[FinMind] refreshAll failed for ${id}:`, e.message);
-            attemptedSet.add(id); // mark attempted so skeleton stops
-            if (cache.has(id)) results[id] = cache.get(id);
-          }
+          try { results[id] = await this.fetchPrice(id); }
+          catch (e) { attemptedSet.add(id); if (cache.has(id)) results[id] = cache.get(id); }
         })
       );
       return results;
     },
-
     getCached(stockId) { return cache.get(stockId) || null; },
   };
 })();
@@ -352,37 +291,27 @@ const Portfolio = (() => {
     save()          { Storage.savePortfolio(stocks); },
     getAll()        { return [...stocks]; },
     getStockIds()   { return stocks.map(s => s.id); },
-
     add(entry) {
       const idx = stocks.findIndex(s => s.id === entry.id);
       if (idx >= 0) stocks[idx] = { ...stocks[idx], ...entry };
       else           stocks.push(entry);
       this.save();
     },
-
     remove(stockId) {
       stocks = stocks.filter(s => s.id !== stockId);
       this.save();
     },
-
     update(originalId, entry) {
       const idx = stocks.findIndex(s => s.id === originalId);
       if (idx >= 0) { stocks[idx] = { ...stocks[idx], ...entry, id: entry.id }; this.save(); }
     },
-
-    // ★ Fix: update only the name field (called after API returns correct name)
     updateName(stockId, name) {
       if (!name || name === stockId) return;
       const idx = stocks.findIndex(s => s.id === stockId);
-      if (idx >= 0 && stocks[idx].name !== name) {
-        stocks[idx].name = name;
-        this.save();
-      }
+      if (idx >= 0 && stocks[idx].name !== name) { stocks[idx].name = name; this.save(); }
     },
-
     setPrices(newPrices)      { prices = { ...prices, ...newPrices }; },
     getPriceData(stockId)     { return prices[stockId] || FinMindAPI.getCached(stockId) || null; },
-
     getStats() {
       let totalValue = 0, totalCost = 0;
       for (const s of stocks) {
@@ -401,13 +330,33 @@ const Portfolio = (() => {
    CHARTS
 ============================================================ */
 const Charts = (() => {
-  let pieChart = null, lineChart = null;
+  let pieChart = null, lineChartValue = null, lineChartPrice = null;
 
   const palette = [
     '#6366f1','#22d3ee','#10b981','#f59e0b','#f43f5e',
     '#a855f7','#3b82f6','#ec4899','#14b8a6','#84cc16',
     '#f97316','#06b6d4','#8b5cf6','#ef4444','#78716c',
   ];
+
+  function getCommonChartOptions(isPrice) {
+    return {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'bottom', labels: { color: '#a5b4fc', usePointStyle: true, boxWidth: 8, font: { family: 'JetBrains Mono', size: 11 } } },
+        tooltip: {
+          callbacks: { label(ctx) { return ` ${ctx.dataset.label}: ${isPrice ? ctx.raw.toFixed(2) : fmt.currency(ctx.raw)}`; } },
+          backgroundColor:'rgba(17,29,53,0.95)', borderColor:'rgba(255,255,255,0.12)', borderWidth:1,
+          titleColor:'#f1f5f9', bodyColor:'#a5b4fc', padding:12,
+        },
+      },
+      scales: {
+        x: { grid:{color:'rgba(255,255,255,0.04)'}, ticks:{color:'#475569', font:{family:'JetBrains Mono',size:10}} },
+        y: { grid:{color:'rgba(255,255,255,0.04)'}, ticks:{color:'#475569', font:{family:'JetBrains Mono',size:10}, callback(v){ return isPrice ? v : fmt.currency(v); }} },
+      },
+      animation: { duration: 500 },
+      interaction: { intersect: false, mode: 'index' },
+    };
+  }
 
   return {
     updatePie(stocks, getPriceData) {
@@ -423,15 +372,14 @@ const Charts = (() => {
 
       const labels = valid.map(s => {
         const p = getPriceData(s.id);
-        return `${s.id} ${p?.name || s.name || ''}`;
+        return p ? p.name : s.id;
       });
       const values = valid.map(s => {
         const p = getPriceData(s.id);
-        return Math.max(0, s.shares * (p?.price || 0));
+        return p ? p.price * s.shares : 0;
       });
 
       if (!pieChart) {
-        if (pieChart) pieChart.destroy();
         pieChart = new Chart(canvas.getContext('2d'), {
           type: 'doughnut',
           data: {
@@ -439,31 +387,21 @@ const Charts = (() => {
             datasets: [{
               data: values,
               backgroundColor: palette.slice(0, labels.length),
-              borderWidth: 2,
-              borderColor: 'rgba(6,11,24,0.8)',
-              hoverOffset: 8,
-            }],
+              borderWidth: 0, hoverOffset: 4
+            }]
           },
           options: {
-            responsive: true, maintainAspectRatio: true, cutout: '62%',
+            responsive: true, maintainAspectRatio: false, cutout: '75%',
             plugins: {
-              legend: {
-                position: 'bottom',
-                labels: { color: '#94a3b8', padding: 12, font: { family: 'Inter', size: 11 }, boxWidth: 12, usePointStyle: true },
-              },
+              legend: { position: 'bottom', labels: { color: '#a5b4fc', usePointStyle: true, boxWidth: 8, font: { family: 'JetBrains Mono', size: 11 } } },
               tooltip: {
-                callbacks: {
-                  label(ctx) {
-                    const total = ctx.dataset.data.reduce((a,b)=>a+b,0);
-                    return ` ${ctx.label}: ${fmt.currency(ctx.raw)} (${total>0?((ctx.raw/total)*100).toFixed(1):0}%)`;
-                  },
-                },
+                callbacks: { label(ctx) { return ` ${ctx.label}: ${fmt.currency(ctx.raw)}`; } },
                 backgroundColor:'rgba(17,29,53,0.95)', borderColor:'rgba(255,255,255,0.12)', borderWidth:1,
-                titleColor:'#f1f5f9', bodyColor:'#94a3b8', padding:12,
-              },
+                titleColor:'#f1f5f9', bodyColor:'#a5b4fc', padding:12,
+              }
             },
-            animation: { duration: 600 },
-          },
+            animation: { animateScale: true, animateRotate: true }
+          }
         });
       } else {
         pieChart.data.labels = labels;
@@ -473,67 +411,111 @@ const Charts = (() => {
       }
     },
 
-    updateLine(history) {
-      const empty  = document.getElementById('line-empty');
-      const canvas = document.getElementById('line-chart');
+    updateLineValue(history) {
+      const empty  = document.getElementById('line-empty-value');
+      const canvas = document.getElementById('line-chart-value');
 
       if (!history || history.length === 0) {
         empty.style.display = ''; canvas.style.display = 'none';
-        if (lineChart) { lineChart.destroy(); lineChart = null; } return;
+        if (lineChartValue) { lineChartValue.destroy(); lineChartValue = null; } return;
       }
       empty.style.display = 'none'; canvas.style.display = 'block';
 
       const labels = history.map(h => h.time.slice(0, 5));
-      const values = history.map(h => h.value);
+      const datasets = [];
 
-      if (!lineChart) {
-        const ctx = canvas.getContext('2d');
-        const gradient = ctx.createLinearGradient(0, 0, 0, 250);
-        gradient.addColorStop(0, 'rgba(99,102,241,0.4)');
-        gradient.addColorStop(1, 'rgba(99,102,241,0)');
+      const ctx = canvas.getContext('2d');
+      const gradient = ctx.createLinearGradient(0, 0, 0, 250);
+      gradient.addColorStop(0, 'rgba(99,102,241,0.4)');
+      gradient.addColorStop(1, 'rgba(99,102,241,0)');
 
-        lineChart = new Chart(ctx, {
-          type: 'line',
-          data: {
-            labels,
-            datasets: [{
-              label: '投資組合市值', data: values,
-              borderColor: '#6366f1', backgroundColor: gradient,
-              borderWidth: 2.5, pointRadius: 5, pointHoverRadius: 8,
-              pointBackgroundColor: '#6366f1', pointBorderColor: '#fff', pointBorderWidth: 2,
-              fill: true, tension: 0.35,
-            }],
-          },
-          options: {
-            responsive: true, maintainAspectRatio: false,
-            plugins: {
-              legend: { display: false },
-              tooltip: {
-                callbacks: { label(ctx) { return ` ${fmt.currency(ctx.raw)}`; } },
-                backgroundColor:'rgba(17,29,53,0.95)', borderColor:'rgba(255,255,255,0.12)',
-                borderWidth:1, titleColor:'#f1f5f9', bodyColor:'#a5b4fc', padding:12,
-              },
-            },
-            scales: {
-              x: { grid:{color:'rgba(255,255,255,0.04)'}, ticks:{color:'#475569', font:{family:'JetBrains Mono',size:10}} },
-              y: { grid:{color:'rgba(255,255,255,0.04)'}, ticks:{color:'#475569', font:{family:'JetBrains Mono',size:10}, callback(v){ return fmt.currency(v); }} },
-            },
-            animation: { duration: 500 },
-            interaction: { intersect: false, mode: 'index' },
-          },
+      datasets.push({
+        label: '投資組合總市值',
+        data: history.map(h => h.value),
+        borderColor: '#6366f1', backgroundColor: gradient,
+        borderWidth: 2.5, pointRadius: 2, pointHoverRadius: 6,
+        fill: true, tension: 0.35,
+      });
+
+      const stockIds = new Set();
+      history.forEach(h => { if (h.stocks) Object.keys(h.stocks).forEach(id => stockIds.add(id)); });
+
+      Array.from(stockIds).forEach((id, i) => {
+        let name = id;
+        const data = history.map(h => {
+          if (h.stocks && h.stocks[id]) {
+            name = h.stocks[id].name;
+            return h.stocks[id].value;
+          }
+          return null;
+        });
+        datasets.push({
+          label: name, data,
+          borderColor: palette[(i + 1) % palette.length],
+          borderWidth: 2, pointRadius: 1, pointHoverRadius: 4,
+          fill: false, tension: 0.3,
+        });
+      });
+
+      if (!lineChartValue) {
+        lineChartValue = new Chart(ctx, {
+          type: 'line', data: { labels, datasets }, options: getCommonChartOptions(false),
         });
       } else {
-        lineChart.data.labels = labels;
-        lineChart.data.datasets[0].data = values;
-        lineChart.update('active');
+        lineChartValue.data.labels = labels;
+        lineChartValue.data.datasets = datasets;
+        lineChartValue.update('active');
       }
     },
+
+    updateLinePrice(history) {
+      const empty  = document.getElementById('line-empty-price');
+      const canvas = document.getElementById('line-chart-price');
+
+      if (!history || history.length === 0) {
+        empty.style.display = ''; canvas.style.display = 'none';
+        if (lineChartPrice) { lineChartPrice.destroy(); lineChartPrice = null; } return;
+      }
+      empty.style.display = 'none'; canvas.style.display = 'block';
+
+      const labels = history.map(h => h.time.slice(0, 5));
+      const datasets = [];
+
+      const stockIds = new Set();
+      history.forEach(h => { if (h.stocks) Object.keys(h.stocks).forEach(id => stockIds.add(id)); });
+
+      Array.from(stockIds).forEach((id, i) => {
+        let name = id;
+        const data = history.map(h => {
+          if (h.stocks && h.stocks[id]) {
+            name = h.stocks[id].name;
+            return h.stocks[id].price;
+          }
+          return null;
+        });
+        datasets.push({
+          label: name, data,
+          borderColor: palette[(i + 1) % palette.length],
+          borderWidth: 2, pointRadius: 1, pointHoverRadius: 4,
+          fill: false, tension: 0.3,
+        });
+      });
+
+      if (!lineChartPrice) {
+        lineChartPrice = new Chart(canvas.getContext('2d'), {
+          type: 'line', data: { labels, datasets }, options: getCommonChartOptions(true),
+        });
+      } else {
+        lineChartPrice.data.labels = labels;
+        lineChartPrice.data.datasets = datasets;
+        lineChartPrice.update('active');
+      }
+    }
   };
 })();
 
 /* ============================================================
    UI RENDERING
-   ★ Fix 3: renderTable — after fetch attempted, show — not skeleton
 ============================================================ */
 const UI = (() => {
   function escHtml(str) {
@@ -585,7 +567,6 @@ const UI = (() => {
         const price      = p ? p.price     : null;
         const change     = p ? p.change    : null;
         const changePct  = p ? p.changePct : null;
-        // ★ Fix 1 result: name comes from API (correct) or localStorage (may have old wrong value)
         const name       = (p && p.name && p.name !== s.id) ? p.name : (s.name || s.id);
 
         const marketValue = price != null ? s.shares * price   : null;
@@ -596,7 +577,6 @@ const UI = (() => {
         const changeClass = change == null ? 'neutral' : change >= 0 ? 'positive' : 'negative';
         const pnlClass    = pnl    == null ? ''        : pnl    >= 0 ? 'positive' : 'negative';
 
-        // ★ Fix 3: stop skeleton after fetch attempted
         const attempted   = FinMindAPI.hasAttempted(s.id);
         const priceCell   = price != null
           ? `<span class="price-cell">${fmt.price(price)}</span>`
@@ -801,7 +781,6 @@ const Refresher = (() => {
       const prices = await FinMindAPI.refreshAll(ids);
       Portfolio.setPrices(prices);
 
-      // ★ Fix: update correct names in localStorage
       Object.entries(prices).forEach(([id, data]) => {
         if (data?.name) Portfolio.updateName(id, data.name);
       });
@@ -814,7 +793,9 @@ const Refresher = (() => {
       Charts.updatePie(stocks, id => Portfolio.getPriceData(id));
 
       if (stats.totalValue > 0) {
-        Charts.updateLine(Storage.appendHistory(stats.totalValue));
+        const hist = Storage.appendHistory(stats, stocks, id => Portfolio.getPriceData(id));
+        Charts.updateLineValue(hist);
+        Charts.updateLinePrice(hist);
       }
 
       if (showFlash) UI.flashValues();
@@ -878,7 +859,9 @@ function renderAll() {
   UI.renderStatCards(Portfolio.getStats());
   UI.renderTable(stocks, id => Portfolio.getPriceData(id));
   Charts.updatePie(stocks, id => Portfolio.getPriceData(id));
-  Charts.updateLine(Storage.getTodayHistory());
+  const hist = Storage.getTodayHistory();
+  Charts.updateLineValue(hist);
+  Charts.updateLinePrice(hist);
   UI.updateMarketStatus(isTaiwanMarketOpen());
 }
 

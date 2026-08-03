@@ -88,38 +88,50 @@
 
     </section>
 
-    <!-- Charts -->
-    <section class="charts-grid" aria-label="圖表分析">
-
-      <div class="card chart-card">
-        <div class="card-header">
-          <h2>持倉配置</h2>
-          <span class="badge">圓餅圖</span>
-        </div>
-        <div class="chart-body" id="pie-container">
-          <div class="chart-empty" id="pie-empty">
-            <div class="empty-icon">🥧</div>
-            <span>新增股票後顯示配置圖</span>
+      <!-- Charts Section -->
+      <div class="charts-grid">
+        <!-- Chart: Asset Allocation -->
+        <div class="card chart-card chart-pie">
+          <div class="card-header">
+            <h2>資產配置</h2>
           </div>
-          <canvas id="pie-chart" style="display:none;" aria-label="持倉配置圓餅圖" role="img"></canvas>
+          <div class="chart-body" role="region" aria-label="圓餅圖區域" tabindex="0">
+            <div class="empty-state" id="pie-empty">
+              <div class="empty-icon">📊</div>
+              <span>尚無持股資料</span>
+            </div>
+            <canvas id="pie-chart" style="display:none;" aria-label="資產配置圓餅圖" role="img"></canvas>
+          </div>
+        </div>
+
+        <!-- Chart: Market Value Trend (Individual Stocks & Total) -->
+        <div class="card chart-card">
+          <div class="card-header">
+            <h2>各股市值走勢</h2>
+          </div>
+          <div class="chart-body" role="region" aria-label="市值走勢折線圖區域" tabindex="0">
+            <div class="empty-state" id="line-empty-value">
+              <div class="empty-icon">📉</div>
+              <span>開市後每 30 分鐘自動記錄</span>
+            </div>
+            <canvas id="line-chart-value" style="display:none;" aria-label="各股市值走勢折線圖" role="img"></canvas>
+          </div>
+        </div>
+
+        <!-- Chart: Price Trend (Individual Stocks) -->
+        <div class="card chart-card">
+          <div class="card-header">
+            <h2>各股股價走勢</h2>
+          </div>
+          <div class="chart-body" role="region" aria-label="股價走勢折線圖區域" tabindex="0">
+            <div class="empty-state" id="line-empty-price">
+              <div class="empty-icon">📈</div>
+              <span>開市後每 30 分鐘自動記錄</span>
+            </div>
+            <canvas id="line-chart-price" style="display:none;" aria-label="各股股價走勢折線圖" role="img"></canvas>
+          </div>
         </div>
       </div>
-
-      <div class="card chart-card">
-        <div class="card-header">
-          <h2>市值走勢</h2>
-          <span class="badge" id="line-chart-badge">今日</span>
-        </div>
-        <div class="chart-body line-body" id="line-container">
-          <div class="chart-empty" id="line-empty">
-            <div class="empty-icon">📉</div>
-            <span>開市後每 30 分鐘自動記錄</span>
-          </div>
-          <canvas id="line-chart" style="display:none;" aria-label="投資組合市值走勢折線圖" role="img"></canvas>
-        </div>
-      </div>
-
-    </section>
 
     <!-- Portfolio Table -->
     <section class="card table-card" aria-label="持股明細">
